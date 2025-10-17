@@ -7,6 +7,23 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ✅ Root route - fixes "Cannot GET /" error
+app.get('/', (req, res) => {
+  res.json({ 
+    message: '🚗 Boost Dash Backend is Running!',
+    status: 'Ready for racing',
+    endpoints: {
+      health: '/health',
+      websocket: 'Available on /socket.io'
+    }
+  });
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'Boost Dash backend is running!' });
+});
+
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
@@ -19,12 +36,7 @@ const io = socketIo(server, {
 const players = new Map();
 const activeRaces = new Map();
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'Boost Dash backend is running!' });
-});
-
-// Race game class (in the same file)
+// Race game class
 class RaceGame {
   constructor(roomId, player1Id, player2Id) {
     this.roomId = roomId;
@@ -153,6 +165,14 @@ io.on('connection', (socket) => {
     players.delete(challenger.id);
     players.delete(acceptor.id);
     io.emit('online-players', Array.from(players.values()));
+  });
+
+  // Decline a challenge
+  socket.on('decline-challenge', (challengerId) => {
+    const challenger = players.get(challengerId);
+    if (challenger) {
+      challenger.socket.emit('challenge-declined');
+    }
   });
 
   // Player action during race
