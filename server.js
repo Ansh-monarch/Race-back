@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
-const GameManager = require('./game/GameManager');
 
 const app = express();
 app.use(cors());
@@ -16,15 +15,72 @@ const io = socketIo(server, {
   }
 });
 
-const gameManager = new GameManager();
-
-// Store connected players
+// Store connected players and active races
 const players = new Map();
+const activeRaces = new Map();
 
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'Boost Dash backend is running!' });
 });
+
+// Race game class (in the same file)
+class RaceGame {
+  constructor(roomId, player1Id, player2Id) {
+    this.roomId = roomId;
+    this.player1 = { id: player1Id, progress: 0, boost: 100, isDrifting: false, username: players.get(player1Id)?.username };
+    this.player2 = { id: player2Id, progress: 0, boost: 100, isDrifting: false, username: players.get(player2Id)?.username };
+    this.startTime = Date.now();
+    this.finished = false;
+    this.winner = null;
+  }
+
+  handlePlayerAction(playerId, action) {
+    const player = this.player1.id === playerId ? this.player1 : this.player2;
+    
+    switch (action) {
+      case 'accelerate':
+        player.progress += 2;
+        break;
+      case 'boost':
+        if (player.boost >= 20) {
+          player.boost -= 20;
+          player.progress += 10;
+        }
+        break;
+      case 'drift-start':
+        player.isDrifting = true;
+        break;
+      case 'drift-end':
+        player.isDrifting = false;
+        player.boost = Math.min(100, player.boost + 15);
+        break;
+    }
+    
+    // Regenerate boost
+    if (!player.isDrifting) {
+      player.boost = Math.min(100, player.boost + 0.5);
+    }
+    
+    // Check for winner (first to 1000 progress)
+    if (player.progress >= 1000 && !this.finished) {
+      this.finished = true;
+      this.winner = playerId;
+      return true; // Race finished
+    }
+    
+    return false; // Race ongoing
+  }
+
+  getGameState() {
+    return {
+      player1: { ...this.player1 },
+      player2: { ...this.player2 },
+      finished: this.finished,
+      winner: this.winner
+    };
+  }
+}
 
 // Socket connection handling
 io.on('connection', (socket) => {
@@ -34,8 +90,7 @@ io.on('connection', (socket) => {
   socket.on('join-lobby', (username) => {
     players.set(socket.id, { 
       id: socket.id, 
-      username: username || `Player${socket.id.slice(-4)}`,
-      socket: socket 
+      username: username || `Player${socket.id.slice(-4)}`
     });
     
     console.log(`${username} joined lobby`);
@@ -62,7 +117,7 @@ io.on('connection', (socket) => {
     console.log(`${challenger.username} challenging ${targetPlayer.username}`);
     
     // Send challenge to target player
-    targetPlayer.socket.emit('challenge-received', {
+    io.to(targetPlayerId).emit('challenge-received', {
       challengerId: challenger.id,
       challengerName: challenger.username
     });
@@ -83,13 +138,15 @@ io.on('connection', (socket) => {
     console.log(`Creating race between ${challenger.username} and ${acceptor.username}`);
     
     // Create a new race game
-    const race = gameManager.createRace(challenger.id, acceptor.id);
+    const raceId = `race_${Date.now()}`;
+    const race = new RaceGame(raceId, challenger.id, acceptor.id);
+    activeRaces.set(raceId, race);
     
     // Notify both players to start the game
     io.to(challenger.id).to(acceptor.id).emit('race-start', {
-      roomId: race.roomId,
-      opponent: acceptor.username,
-      track: race.track
+      roomId: raceId,
+      player1: race.player1,
+      player2: race.player2
     });
     
     // Remove from online players list during race
@@ -98,47 +155,27 @@ io.on('connection', (socket) => {
     io.emit('online-players', Array.from(players.values()));
   });
 
-  // Decline a challenge
-  socket.on('decline-challenge', (challengerId) => {
-    const challenger = players.get(challengerId);
-    if (challenger) {
-      challenger.socket.emit('challenge-declined');
-    }
-  });
-
   // Player action during race
   socket.on('player-action', (data) => {
     const { roomId, action } = data;
-    const race = gameManager.getRace(roomId);
-    
-    if (race && race.isPlayerInRace(socket.id)) {
-      race.handlePlayerAction(socket.id, action);
-      
-      // Send updated game state to both players
-      const gameState = race.getGameState();
-      io.to(race.player1.id).to(race.player2.id).emit('game-update', gameState);
-    }
-  });
-
-  // Player finished race
-  socket.on('race-finish', (data) => {
-    const { roomId, finishTime } = data;
-    const race = gameManager.getRace(roomId);
+    const race = activeRaces.get(roomId);
     
     if (race) {
-      const result = race.playerFinish(socket.id, finishTime);
-      if (result.finished) {
-        // Race is over, send final results
-        io.to(race.player1.id).to(race.player2.id).emit('race-end', {
-          winner: result.winner,
-          times: result.times,
-          winnerName: players.get(result.winner)?.username || 'Unknown'
-        });
-        
-        // Clean up the race after a delay
+      const raceFinished = race.handlePlayerAction(socket.id, action);
+      const gameState = race.getGameState();
+      
+      // Send updated game state to both players
+      io.to(race.player1.id).to(race.player2.id).emit('game-update', gameState);
+      
+      // If race finished, clean up after delay
+      if (raceFinished) {
         setTimeout(() => {
-          gameManager.removeRace(roomId);
-        }, 10000);
+          activeRaces.delete(roomId);
+          // Add players back to lobby
+          players.set(race.player1.id, { id: race.player1.id, username: race.player1.username });
+          players.set(race.player2.id, { id: race.player2.id, username: race.player2.username });
+          io.emit('online-players', Array.from(players.values()));
+        }, 5000);
       }
     }
   });
@@ -153,7 +190,15 @@ io.on('connection', (socket) => {
     }
     
     // Clean up any races this player was in
-    gameManager.handlePlayerDisconnect(socket.id);
+    for (const [raceId, race] of activeRaces) {
+      if (race.player1.id === socket.id || race.player2.id === socket.id) {
+        activeRaces.delete(raceId);
+        // Notify other player
+        const otherPlayerId = race.player1.id === socket.id ? race.player2.id : race.player1.id;
+        io.to(otherPlayerId).emit('opponent-disconnected');
+        break;
+      }
+    }
   });
 });
 
